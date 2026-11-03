@@ -1,0 +1,30 @@
+name: Build macOS app
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          swift --version
+
+      - name: Build universal app
+        run: ./scripts/build-app.sh
+
+      - name: Self-test (editing logic + real exports, including a full 10-hour video)
+        run: '"dist/10 Hour Vids.app/Contents/MacOS/TenHourVids" --self-test --long'
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: TenHourVids-macOS
+          path: dist/TenHourVids-macOS.zip
