@@ -40,8 +40,9 @@ at 1080p with 256 kbps audio).
 
 ### Option A: download the built app
 
-Every push to this repository is built and tested on a macOS 14 runner by GitHub Actions
-(see the **Actions** tab, then the latest *Build macOS app* run, then the **TenHourVids-macOS** artifact).
+**[Download TenHourVids-macOS.zip](https://github.com/Lorca7/10-Hour-Vids/releases/latest/download/TenHourVids-macOS.zip)**
+(the latest build from the [Releases page](https://github.com/Lorca7/10-Hour-Vids/releases)).
+Each build is compiled and self-tested on macOS 14 by GitHub Actions before it is published.
 Unzip it and drag **10 Hour Vids.app** into Applications.
 
 The app is not notarised by Apple, so the first time you open it, **right-click the app, choose Open,

@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-14
@@ -28,3 +31,23 @@ jobs:
         with:
           name: TenHourVids-macOS
           path: dist/TenHourVids-macOS.zip
+
+      # Every tested build of main becomes a GitHub Release, so there's always a permanent
+      # download link: https://github.com/<owner>/<repo>/releases/latest/download/TenHourVids-macOS.zip
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" dist/TenHourVids-macOS.zip \
+            --title "10 Hour Vids $TAG" \
+            --target "${{ github.sha }}" \
+            --latest \
+            --notes "Universal macOS app (Apple Silicon + Intel) for macOS 14 Sonoma or later.
+
+          Download **TenHourVids-macOS.zip** below, unzip it, and drag **10 Hour Vids.app** into Applications.
+          The first time, right-click the app → **Open** → **Open** (it isn't notarised by Apple).
+          If macOS says it is damaged, run: \`xattr -dr com.apple.quarantine \"/Applications/10 Hour Vids.app\"\`
+
+          This build passed the self-test, including a full 10-hour export."
