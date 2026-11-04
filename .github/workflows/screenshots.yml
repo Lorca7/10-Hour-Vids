@@ -5,6 +5,9 @@ on:
     branches: [claude/ui-screenshots]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   shots:
     runs-on: macos-14
@@ -22,3 +25,14 @@ jobs:
           name: ui-screenshots
           path: shots
           if-no-files-found: warn
+
+      - name: Commit screenshots to docs/screenshots
+        if: github.ref == 'refs/heads/claude/ui-screenshots'
+        run: |
+          mkdir -p docs/screenshots
+          cp shots/*.png docs/screenshots/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/screenshots
+          git commit -m "Add UI screenshots captured on macOS 14" || exit 0
+          git push
