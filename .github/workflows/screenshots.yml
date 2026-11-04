@@ -1,0 +1,24 @@
+name: UI screenshots
+
+on:
+  push:
+    branches: [claude/ui-screenshots]
+  workflow_dispatch:
+
+jobs:
+  shots:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: swift build -c release
+      - name: Capture the interface
+        run: .build/release/TenHourVids --screenshots shots
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-screenshots
+          path: shots
+          if-no-files-found: warn
