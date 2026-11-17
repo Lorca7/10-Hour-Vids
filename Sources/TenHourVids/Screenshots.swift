@@ -144,17 +144,14 @@ enum Screenshots {
         print("  captured \(url.lastPathComponent) \(image.width)×\(image.height)")
     }
 
-    /// The whole window including title bar and toolbar when possible, otherwise just its content.
+    /// The whole window, including its title bar and toolbar when AppKit can draw them.
     private static func snapshot(_ window: NSWindow) -> CGImage? {
-        let id = CGWindowID(window.windowNumber)
-        if let cg = CGWindowListCreateImage(.null, .optionIncludingWindow, id, [.boundsIgnoreFraming, .bestResolution]),
-           cg.width > 100, cg.height > 100 {
-            return cg
+        for view in [window.contentView?.superview, window.contentView].compactMap({ $0 }) {
+            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            if let image = rep.cgImage, image.width > 100, image.height > 100 { return image }
         }
-        guard let view = window.contentView,
-              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        return rep.cgImage
+        return nil
     }
 
     // MARK: - Sample media
