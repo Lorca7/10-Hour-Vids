@@ -2,7 +2,7 @@ name: UI screenshots
 
 on:
   push:
-    branches: [claude/ui-screenshots]
+    branches: [claude/ui-screenshots, claude/video-clips]
   workflow_dispatch:
 
 permissions:
@@ -27,7 +27,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Commit screenshots to docs/screenshots
-        if: github.ref == 'refs/heads/claude/ui-screenshots'
+        if: github.event_name == 'push'
         run: |
           mkdir -p docs/screenshots
           cp shots/*.png docs/screenshots/

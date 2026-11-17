@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import AVFoundation
 
 extension Color {
     init(_ c: RGBColor) { self.init(.sRGB, red: c.r, green: c.g, blue: c.b, opacity: 1) }
@@ -30,7 +31,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 TransportBar(model: model)
                 Divider()
-                TimelinePanel(model: model, waveforms: model.waveforms)
+                TimelinePanel(model: model, waveforms: model.waveforms, thumbnails: model.thumbnails)
             }
             .frame(minHeight: 240, idealHeight: 320)
         }
@@ -39,8 +40,8 @@ struct ContentView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button { model.importImagePanel() } label: { Label("Photo", systemImage: "photo.badge.plus") }
                     .help("Choose the photo for the video (⌘I)")
-                Button { model.addAudioPanel() } label: { Label("Add Audio", systemImage: "music.note.list") }
-                    .help("Add music or audio files (⇧⌘I)")
+                Button { model.addMediaPanel() } label: { Label("Add Audio or Video", systemImage: "film.stack") }
+                    .help("Add music, audio or video clips (⇧⌘I)")
                 Button { model.showExport = true } label: { Label("Export", systemImage: "square.and.arrow.up") }
                     .help("Export an MP4 for YouTube (⌘E)")
             }
@@ -66,7 +67,44 @@ struct ContentView: View {
         } message: {
             Text(model.errorMessage ?? "")
         }
-        .onAppear { model.installEventMonitors() }
+        .onAppear {
+            model.installEventMonitors()
+            // Don't start with a text field in the inspector focused.
+            DispatchQueue.main.async { NSApp.keyWindow?.makeFirstResponder(nil) }
+        }
+    }
+}
+
+/// Shows an AVPlayer's video (used for previewing video clips while playing).
+struct PlayerLayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> PlayerNSView {
+        let view = PlayerNSView()
+        view.playerLayer.player = player
+        return view
+    }
+
+    func updateNSView(_ view: PlayerNSView, context: Context) {
+        if view.playerLayer.player !== player { view.playerLayer.player = player }
+    }
+}
+
+final class PlayerNSView: NSView {
+    let playerLayer = AVPlayerLayer()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        playerLayer.videoGravity = .resizeAspect
+        layer?.addSublayer(playerLayer)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        playerLayer.frame = bounds
     }
 }
 
@@ -90,21 +128,33 @@ struct PreviewPane: View {
                             .font(.system(size: 44))
                         Text("Drag & drop a photo here")
                             .font(.title3.weight(.semibold))
-                        Text("Then drop music or audio files onto the timeline below.")
+                        Text("Then drop music, audio or video clips onto the timeline below.")
                             .font(.callout)
+                            .multilineTextAlignment(.center)
                             .opacity(0.8)
                         Button("Choose Photo…") { model.importImagePanel() }
                             .controlSize(.large)
                             .padding(.top, 4)
                     }
                     .foregroundStyle(.white)
-                    .padding()
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 22)
                     .background(
                         RoundedRectangle(cornerRadius: 12)
                             .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
                             .foregroundStyle(.white.opacity(0.5))
-                            .padding(18)
                     )
+                }
+                // A video clip under the playhead: a still frame while paused, live video while playing.
+                if model.clipAtPlayhead, let still = model.stillFrame, !(model.isPlaying && model.videoVisible) {
+                    Image(nsImage: still)
+                        .resizable()
+                        .interpolation(.high)
+                }
+                if model.isPlaying, let player = model.player {
+                    PlayerLayerView(player: player)
+                        .opacity(model.videoVisible ? 1 : 0)
+                        .allowsHitTesting(false)
                 }
             }
             .aspectRatio(16 / 9, contentMode: .fit)
@@ -262,7 +312,7 @@ struct VideoInspector: View {
                         Button(presets[i].0) { model.setDuration(presets[i].1, refit: true) }
                     }
                 }
-                Button("Match Length to Audio") { model.matchAudioLength() }
+                Button("Match Length to Clips") { model.matchAudioLength() }
                     .disabled(model.project.clips.isEmpty)
                 Text("Anywhere from 1 minute to 10 hours. You can also drag the right edge of the video bar in the timeline.")
                     .font(.caption)
@@ -286,9 +336,9 @@ struct VideoInspector: View {
 
 struct ClipInspector: View {
     @ObservedObject var model: EditorModel
-    let clip: AudioClip
+    let clip: MediaClip
 
-    private func binding(_ keyPath: WritableKeyPath<AudioClip, Double>) -> Binding<Double> {
+    private func binding(_ keyPath: WritableKeyPath<MediaClip, Double>) -> Binding<Double> {
         let id = clip.id
         return Binding(
             get: { model.clip(id)?[keyPath: keyPath] ?? 0 },
@@ -302,7 +352,7 @@ struct ClipInspector: View {
         let id = clip.id
         let fadeMax = max(0.1, min(30, clip.length / 2))
         Form {
-            Section("Audio Clip") {
+            Section(clip.kind == .video ? "Video Clip" : "Audio Clip") {
                 Text(clip.name).font(.headline)
                 Text("\(clip.url.lastPathComponent) · \(Timecode.format(clip.sourceDuration, tenths: true)) long")
                     .font(.caption)
@@ -338,7 +388,12 @@ struct ClipInspector: View {
                 }
             }
 
-            Section("Sound") {
+            Section(clip.kind == .video ? "Clip Sound" : "Sound") {
+                if clip.kind == .video {
+                    Text("The video’s own sound. Set the volume to 0% to mute it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 LabeledContent("Volume") {
                     HStack {
                         Slider(value: binding(\.volume), in: 0...1)
@@ -370,7 +425,9 @@ struct ClipInspector: View {
                                                         set: { model.setLoop(id, $0) }))
                 Button("Loop to End of Video") { model.fillToEnd(id) }
                     .disabled(clip.start >= model.project.video.duration)
-                Text("A looped clip repeats until you stop it — drag its right edge as far as you like.")
+                Text(clip.kind == .video
+                     ? "A looped video repeats its section (from “Starts from” to “Loop back at”) until the clip ends — drag its right edge as far as you like. Each loop is encoded once, so long loops export quickly."
+                     : "A looped clip repeats until you stop it — drag its right edge as far as you like.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -414,8 +471,9 @@ struct ExportSheet: View {
     private var settings: some View {
         let duration = model.project.video.duration
         let hasAudio = !model.project.clips.isEmpty
-        let audioEnd = min(model.project.audioEnd, duration)
-        let estimate = model.exportSettings.estimatedBytes(duration: duration, hasAudio: hasAudio)
+        let audioEnd = min(model.project.mediaEnd, duration)
+        let videoSeconds = model.project.videoClipSeconds
+        let estimate = model.exportSettings.estimatedBytes(duration: duration, hasAudio: hasAudio, videoSeconds: videoSeconds)
         return VStack(alignment: .leading, spacing: 14) {
             Form {
                 Picker("Resolution", selection: $model.exportSettings.resolution) {
@@ -430,11 +488,19 @@ struct ExportSheet: View {
                 LabeledContent("Length", value: Timecode.format(duration))
                 LabeledContent("Format", value: "MP4 · H.264 · AAC 48 kHz stereo")
                 LabeledContent("Approx. file size", value: Timecode.byteCount(estimate))
+                LabeledContent("Encoding on") {
+                    Text(model.hardwareSummary)
+                        .multilineTextAlignment(.trailing)
+                        .foregroundStyle(.secondary)
+                }
             }
             .formStyle(.grouped)
 
             if model.project.imageURL == nil {
-                Label("No photo yet — the video will be a plain background colour.", systemImage: "exclamationmark.triangle")
+                Label(videoSeconds > 0
+                      ? "No photo — wherever no video clip plays, the video shows a plain background colour."
+                      : "No photo yet — the video will be a plain background colour.",
+                      systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             }
             if !hasAudio {

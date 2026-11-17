@@ -36,7 +36,7 @@ struct AppCommands: Commands {
             Divider()
             Button("Import Photo…") { model.importImagePanel() }
                 .keyboardShortcut("i")
-            Button("Add Audio…") { model.addAudioPanel() }
+            Button("Add Audio or Video…") { model.addMediaPanel() }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
         }
         CommandGroup(replacing: .saveItem) {
@@ -63,7 +63,7 @@ struct AppCommands: Commands {
             Button("Delete Selected Clip  (⌫)") { model.deleteSelection() }
                 .disabled(model.selectedClip == nil)
             Divider()
-            Button("Match Video Length to Audio") { model.matchAudioLength() }
+            Button("Match Video Length to Clips") { model.matchAudioLength() }
                 .disabled(model.project.clips.isEmpty)
             Divider()
             Button("Zoom In") { model.zoom(by: 1.5) }

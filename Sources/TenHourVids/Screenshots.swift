@@ -21,6 +21,10 @@ enum Screenshots {
             try makePhoto(photo)
             try makeAudio(rain, seconds: 60, kind: .rain)
             try makeAudio(piano, seconds: 45, kind: .piano)
+            let waves = work.appendingPathComponent("Ocean Waves.mov")
+            try await TestMedia.makeVideo(waves, width: 960, height: 540, fps: 30, frames: 240) { i, ctx, size in
+                Screenshots.drawWaves(frame: i, ctx: ctx, size: size)
+            }
 
             let size = CGSize(width: 1320, height: 860)
 
@@ -29,7 +33,7 @@ enum Screenshots {
             try await capture(ContentView(model: empty), size: size, dark: false, to: outDir.appendingPathComponent("01-empty.png"))
 
             // 2. Photo and audio loaded, video selected
-            let model = makeModel(photo: photo, rain: rain, piano: piano)
+            let model = makeModel(photo: photo, rain: rain, piano: piano, video: waves)
             model.selection = .video
             try await capture(ContentView(model: model), size: size, dark: false, to: outDir.appendingPathComponent("02-video-settings.png"))
 
@@ -40,7 +44,14 @@ enum Screenshots {
             // 4. Dark mode
             try await capture(ContentView(model: model), size: size, dark: true, to: outDir.appendingPathComponent("04-dark-mode.png"))
 
-            // 5. Export dialog
+            // 5. A video clip selected, with the playhead inside it
+            if let video = model.project.clips.first(where: { $0.kind == .video }) {
+                model.selection = .clip(video.id)
+                model.playhead = 5400
+            }
+            try await capture(ContentView(model: model), size: size, dark: false, to: outDir.appendingPathComponent("06-video-clip.png"))
+
+            // 6. Export dialog
             try await capture(ExportSheet(model: model), size: CGSize(width: 500, height: 470), dark: false,
                               to: outDir.appendingPathComponent("05-export.png"))
             print("Saved screenshots to \(outDir.path)")
@@ -53,12 +64,12 @@ enum Screenshots {
 
     // MARK: - Sample project
 
-    private static func makeModel(photo: URL, rain: URL, piano: URL) -> EditorModel {
+    private static func makeModel(photo: URL, rain: URL, piano: URL, video: URL) -> EditorModel {
         let m = EditorModel()
         m.setImage(photo)
         m.setDuration(8 * 3600)
 
-        var a = AudioClip(url: rain, name: "Rain on Window", sourceDuration: 60, inPoint: 0, outPoint: 60,
+        var a = MediaClip(url: rain, name: "Rain on Window", sourceDuration: 60, inPoint: 0, outPoint: 60,
                           start: 0, length: 8 * 3600, lane: 0)
         a.loop = true
         a.fadeIn = 8
@@ -66,7 +77,7 @@ enum Screenshots {
         a.volume = 0.85
         a.normalize()
 
-        var b = AudioClip(url: piano, name: "Soft Piano", sourceDuration: 45, inPoint: 0, outPoint: 45,
+        var b = MediaClip(url: piano, name: "Soft Piano", sourceDuration: 45, inPoint: 0, outPoint: 45,
                           start: 1200, length: 5 * 3600, lane: 1)
         b.loop = true
         b.fadeIn = 20
@@ -74,9 +85,41 @@ enum Screenshots {
         b.volume = 0.6
         b.normalize()
 
-        m.project.clips = [a, b]
+        var v = MediaClip(url: video, name: "Ocean Waves", sourceDuration: 8, inPoint: 0, outPoint: 8,
+                          start: 3600, length: 2 * 3600, lane: 0)
+        v.kind = .video
+        v.loop = true
+        v.volume = 0
+        v.normalize()
+
+        m.project.clips = [a, b, v]
         m.playhead = 2400
         return m
+    }
+
+    /// A simple animated seascape for the sample video clip.
+    static func drawWaves(frame i: Int, ctx: CGContext, size: CGSize) {
+        let space = CGColorSpace(name: CGColorSpace.sRGB)!
+        let colors = [CGColor(srgbRed: 0.55, green: 0.80, blue: 0.95, alpha: 1),
+                      CGColor(srgbRed: 0.05, green: 0.35, blue: 0.60, alpha: 1)] as CFArray
+        let gradient = CGGradient(colorsSpace: space, colors: colors, locations: [0, 1])!
+        ctx.drawLinearGradient(gradient, start: CGPoint(x: 0, y: size.height), end: .zero, options: [])
+        let phase = Double(i) / 240 * 2 * Double.pi  // loops seamlessly every 8 s
+        for row in 0..<7 {
+            let baseY = size.height * (0.12 + 0.09 * CGFloat(row))
+            let path = CGMutablePath()
+            var x: CGFloat = 0
+            path.move(to: CGPoint(x: 0, y: baseY))
+            while x <= size.width {
+                let y = baseY + 10 * CGFloat(sin(Double(x) / 70 + phase + Double(row)))
+                path.addLine(to: CGPoint(x: x, y: y))
+                x += 8
+            }
+            ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.55 - 0.05 * CGFloat(row)))
+            ctx.setLineWidth(4)
+            ctx.addPath(path)
+            ctx.strokePath()
+        }
     }
 
     // MARK: - Capture
