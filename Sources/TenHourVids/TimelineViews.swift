@@ -248,7 +248,8 @@ struct TracksArea: View {
                 .offset(x: model.x(for: model.playhead) - 0.75)
                 .allowsHitTesting(false)
         }
-        .frame(width: width, height: height, alignment: .topLeading)
+        // Take exactly the width offered: a fixed width here would push the whole window wider.
+        .frame(minWidth: 0, maxWidth: .infinity, minHeight: height, maxHeight: height, alignment: .topLeading)
         .clipped()
         .overlay {
             if dropTargeted {
@@ -439,8 +440,8 @@ struct ClipView: View {
                 .opacity(0.75)
             }
             Canvas { ctx, size in
-                // Loop boundaries
-                if clip.loop {
+                // Loop boundaries, when they're far enough apart to be useful
+                if clip.loop && clip.region * pps >= 6 {
                     for segment in clip.segments() where segment.timelineStart > clip.start + 0.001 {
                         let x = CGFloat((segment.timelineStart - visibleStart) * pps) - x0
                         if x >= 0 && x <= size.width {

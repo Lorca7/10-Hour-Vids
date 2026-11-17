@@ -265,9 +265,9 @@ enum ExportResolution: String, CaseIterable, Identifiable, Codable {
     /// Average bit rate for the encoder (YouTube's recommended upload rates).
     var bitrate: Int {
         switch self {
-        case .hd720: return 6_000_000
-        case .hd1080: return 12_000_000
-        case .qhd1440: return 20_000_000
+        case .hd720: return 5_000_000
+        case .hd1080: return 8_000_000
+        case .qhd1440: return 16_000_000
         case .uhd2160: return 40_000_000
         }
     }
