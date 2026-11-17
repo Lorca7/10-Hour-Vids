@@ -42,18 +42,22 @@ struct VideoSettings: Codable, Equatable {
 
 // MARK: - Audio clips
 
+enum ClipKind: String, Codable {
+    case audio, video
+}
+
 struct ClipSegment: Equatable {
     let sourceStart: Double
     let duration: Double
     let timelineStart: Double
 }
 
-/// One piece of audio on the timeline.
+/// One audio or video clip on the timeline.
 ///
 /// The clip plays the source file from `inPoint` onwards. When `loop` is on, the region
 /// `inPoint ..< outPoint` repeats until the clip's `length` is filled, starting `offset`
 /// seconds into that region (this is how a looped clip can be split or trimmed from the left).
-struct AudioClip: Codable, Identifiable, Equatable {
+struct MediaClip: Codable, Identifiable, Equatable {
     var id: UUID = UUID()
     var url: URL
     var name: String
@@ -68,6 +72,13 @@ struct AudioClip: Codable, Identifiable, Equatable {
     var fadeIn: Double = 0
     var fadeOut: Double = 0
     var loop: Bool = false
+    /// Stored only for video clips, so projects saved before video support still open.
+    var mediaKind: ClipKind?
+
+    var kind: ClipKind {
+        get { mediaKind ?? .audio }
+        set { mediaKind = newValue == .audio ? nil : newValue }
+    }
 
     var end: Double { start + length }
     var region: Double { max(outPoint - inPoint, 0.001) }
@@ -82,7 +93,7 @@ struct AudioClip: Codable, Identifiable, Equatable {
     func sourceTime(at t: Double) -> Double {
         let local = t - start
         if !loop { return inPoint + local }
-        return inPoint + AudioClip.wrap(offset + local, region)
+        return inPoint + MediaClip.wrap(offset + local, region)
     }
 
     /// Volume (0...1) at timeline time `t`, including fades.
@@ -102,7 +113,7 @@ struct AudioClip: Codable, Identifiable, Equatable {
         var result: [ClipSegment] = []
         var remaining = length
         var t = start
-        var src = inPoint + AudioClip.wrap(offset, region)
+        var src = inPoint + MediaClip.wrap(offset, region)
         while remaining > 0.0005 {
             var d = min(outPoint - src, remaining)
             if d <= 0.0005 { src = inPoint; d = min(region, remaining) }
@@ -124,7 +135,7 @@ struct AudioClip: Codable, Identifiable, Equatable {
         if loop {
             outPoint = min(max(outPoint, inPoint + Limits.minLoopRegion), sourceDuration)
             length = min(max(length, minLen), Limits.maxDuration)
-            offset = AudioClip.wrap(offset, region)
+            offset = MediaClip.wrap(offset, region)
         } else {
             offset = 0
             length = min(max(length, minLen), sourceDuration - inPoint)
@@ -141,7 +152,7 @@ struct AudioClip: Codable, Identifiable, Equatable {
     }
 
     /// Splits the clip at timeline time `t`, returning the left and right halves.
-    func split(at t: Double) -> (AudioClip, AudioClip)? {
+    func split(at t: Double) -> (MediaClip, MediaClip)? {
         guard t > start + Limits.minClipLength, t < end - Limits.minClipLength else { return nil }
         let o = t - start
         var a = self
@@ -153,7 +164,7 @@ struct AudioClip: Codable, Identifiable, Equatable {
         b.length = length - o
         b.fadeIn = 0
         if loop {
-            b.offset = AudioClip.wrap(offset + o, region)
+            b.offset = MediaClip.wrap(offset + o, region)
         } else {
             a.outPoint = inPoint + o
             b.inPoint = inPoint + o
@@ -163,8 +174,8 @@ struct AudioClip: Codable, Identifiable, Equatable {
         return (a, b)
     }
 
-    func overlaps(_ other: AudioClip) -> Bool {
-        lane == other.lane && start < other.end - 0.0001 && other.start < end - 0.0001
+    func overlaps(_ other: MediaClip) -> Bool {
+        kind == other.kind && lane == other.lane && start < other.end - 0.0001 && other.start < end - 0.0001
     }
 }
 
@@ -172,9 +183,61 @@ struct Project: Codable, Equatable {
     var version = 1
     var imageURL: URL?
     var video = VideoSettings()
-    var clips: [AudioClip] = []
+    var clips: [MediaClip] = []
 
-    var audioEnd: Double { clips.map(\.end).max() ?? 0 }
+    var mediaEnd: Double { clips.map(\.end).max() ?? 0 }
+}
+
+/// A stretch of the finished video showing either the photo (`clipID == nil`) or one video clip.
+struct VideoSpan: Equatable {
+    var start: Double
+    var end: Double
+    var clipID: UUID?
+}
+
+extension Project {
+    var hasVideoClips: Bool { clips.contains { $0.kind == .video } }
+
+    /// The video clip seen at time `t`: the highest lane wins, then the clip added last.
+    func topVideoClip(at t: Double) -> MediaClip? {
+        guard t >= 0, t < video.duration else { return nil }
+        var best: (lane: Int, index: Int)?
+        var result: MediaClip?
+        for (i, c) in clips.enumerated() where c.kind == .video && c.start <= t && t < c.end {
+            if best == nil || (c.lane, i) > (best!.lane, best!.index) {
+                best = (c.lane, i)
+                result = c
+            }
+        }
+        return result
+    }
+
+    /// The whole video split into stretches of photo and visible video clips, in order.
+    func videoSpans() -> [VideoSpan] {
+        let duration = video.duration
+        var bounds: Set<Double> = [0, duration]
+        for c in clips where c.kind == .video {
+            for b in [c.start, c.end] where b > 0 && b < duration { bounds.insert(b) }
+        }
+        let sorted = bounds.sorted()
+        var spans: [VideoSpan] = []
+        for i in 0..<(sorted.count - 1) {
+            let a = sorted[i], b = sorted[i + 1]
+            guard b - a > 1e-9 else { continue }
+            let id = topVideoClip(at: (a + b) / 2)?.id
+            if let last = spans.last, last.clipID == id {
+                spans[spans.count - 1].end = b
+            } else {
+                spans.append(VideoSpan(start: a, end: b, clipID: id))
+            }
+        }
+        return spans
+    }
+
+    /// Seconds of the finished video that show a video clip rather than the photo.
+    var videoClipSeconds: Double {
+        videoSpans().filter { $0.clipID != nil }.reduce(0) { $0 + $1.end - $1.start }
+    }
 }
 
 // MARK: - Export
@@ -199,12 +262,12 @@ enum ExportResolution: String, CaseIterable, Identifiable, Codable {
         case .uhd2160: return "4K (3840 × 2160)"
         }
     }
-    /// Bit budget handed to the encoder for the still picture.
+    /// Average bit rate for the encoder (YouTube's recommended upload rates).
     var bitrate: Int {
         switch self {
-        case .hd720: return 6_000_000
-        case .hd1080: return 12_000_000
-        case .qhd1440: return 20_000_000
+        case .hd720: return 5_000_000
+        case .hd1080: return 8_000_000
+        case .qhd1440: return 16_000_000
         case .uhd2160: return 40_000_000
         }
     }
@@ -217,9 +280,11 @@ struct ExportSettings: Equatable {
     /// Seconds between full keyframes. The picture never changes, so long gaps keep files small.
     static let keyframeInterval = 10
 
-    func estimatedBytes(duration: Double, hasAudio: Bool) -> Double {
+    func estimatedBytes(duration: Double, hasAudio: Bool, videoSeconds: Double = 0) -> Double {
         let keyframeBytes = Double(resolution.width * resolution.height) * 0.3
-        let video = keyframeBytes * duration / Double(Self.keyframeInterval) + duration * Double(fps) * 40
+        let photoSeconds = max(0, duration - videoSeconds)
+        let video = keyframeBytes * photoSeconds / Double(Self.keyframeInterval) + photoSeconds * Double(fps) * 40
+            + videoSeconds * Double(resolution.bitrate) / 8
         let audio = hasAudio ? Double(audioBitrate) / 8 * duration : 0
         return video + audio
     }

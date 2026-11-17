@@ -26,19 +26,31 @@ enum SelfTest {
 
             print("Editing logic")
             testClipMath()
+            testVideoPlan()
             await testEditorModel()
 
             let imageURL = dir.appendingPathComponent("photo.png")
             let toneURL = dir.appendingPathComponent("tone.wav")
             try makeTestImage(imageURL)
             try makeTone(toneURL, seconds: 20)
+            // A 4-second test video with sound: green for 2 s, then blue for 2 s.
+            let videoURL = dir.appendingPathComponent("clip.mov")
+            try await TestMedia.makeVideo(videoURL, width: 640, height: 480, fps: 30, frames: 120, audio: toneURL) { i, ctx, size in
+                let c = i < 60 ? SelfTest.green : SelfTest.blue
+                ctx.setFillColor(CGColor(srgbRed: c.r, green: c.g, blue: c.b, alpha: 1))
+                ctx.fill(CGRect(origin: .zero, size: size))
+            }
+
+            print("Thumbnails")
+            let thumbs = await ThumbnailStore.compute(videoURL)
+            check(thumbs.count >= 6, "\(thumbs.count) filmstrip thumbnails")
 
             print("Waveform")
             let peaks = try await WaveformStore.compute(toneURL)
             check(abs(Double(peaks.count) - 20 * WaveformStore.peaksPerSecond) <= 2, "waveform has \(peaks.count) peaks for 20 s")
             check((peaks.max() ?? 0) > 0.9, "waveform is normalised")
 
-            let tone = AudioClip(url: toneURL, name: "tone", sourceDuration: 20, inPoint: 0, outPoint: 20,
+            let tone = MediaClip(url: toneURL, name: "tone", sourceDuration: 20, inPoint: 0, outPoint: 20,
                                  start: 0, length: 20, lane: 0)
 
             print("Export 1: 75 s, 1080p30, fit, looped audio with fades + a second overlapping clip")
@@ -84,8 +96,31 @@ enum SelfTest {
             try await exportAndVerify(project, settings, to: dir.appendingPathComponent("c.mp4"), expectPillarbox: false,
                                       loudAt: 40, quietAt: 10)
 
+            print("Export 4: 90 s, 1080p30, video clips over the photo (looped, stacked, single) with their sound")
+            project = Project()
+            project.imageURL = imageURL
+            project.video.duration = 90
+            project.clips = sampleVideoClips(videoURL)
+            try await exportAndVerify(project, ExportSettings(), to: dir.appendingPathComponent("v.mp4"), expectPillarbox: true,
+                                      loudAt: 20, quietAt: 85,
+                                      frames: [(5, "photo"), (11, "green"), (13, "blue"), (31, "blue"), (50.5, "green"),
+                                               (52.5, "blue"), (72, "photo"), (76, "green"), (77.5, "blue"), (85, "photo")])
+
             if long {
-                print("Export 4: 10 hours, 1080p30, looped audio (speed test)")
+                print("Export 6: 10 hours, 1080p30, one 4-second video clip looped the whole way (speed test)")
+                project = Project()
+                project.imageURL = imageURL
+                project.video.duration = Limits.maxDuration
+                var loop = MediaClip(url: videoURL, name: "clip", sourceDuration: 4, inPoint: 0, outPoint: 4,
+                                     start: 0, length: Limits.maxDuration, lane: 0)
+                loop.kind = .video
+                loop.loop = true
+                project.clips = [loop]
+                try await exportAndVerify(project, ExportSettings(), to: dir.appendingPathComponent("vl.mp4"),
+                                          expectPillarbox: true, loudAt: 30_000,
+                                          frames: [(0.5, "green"), (18_000.5, "green"), (18_002.5, "blue"), (35_999.5, "blue")])
+
+                print("Export 5: 10 hours, 1080p30, looped audio (speed test)")
                 project = Project()
                 project.imageURL = imageURL
                 project.video.duration = Limits.maxDuration
@@ -116,7 +151,7 @@ enum SelfTest {
         check(Timecode.format(3723.46, tenths: true) == "1:02:03.5", "format tenths")
 
         let url = URL(fileURLWithPath: "/tmp/x.wav")
-        var c = AudioClip(url: url, name: "x", sourceDuration: 100, inPoint: 10, outPoint: 40,
+        var c = MediaClip(url: url, name: "x", sourceDuration: 100, inPoint: 10, outPoint: 40,
                           start: 5, length: 70, lane: 0)
         c.loop = true
         c.normalize()
@@ -133,7 +168,7 @@ enum SelfTest {
             check(false, "split succeeded")
         }
 
-        var plain = AudioClip(url: url, name: "p", sourceDuration: 60, inPoint: 0, outPoint: 60,
+        var plain = MediaClip(url: url, name: "p", sourceDuration: 60, inPoint: 0, outPoint: 60,
                               start: 0, length: 60, lane: 0)
         if let halves = plain.split(at: 20) {
             check(abs(halves.0.outPoint - 20) < 1e-6 && abs(halves.1.inPoint - 20) < 1e-6, "split plain clip source points")
@@ -153,7 +188,7 @@ enum SelfTest {
         await MainActor.run {
             let model = EditorModel()
             let url = URL(fileURLWithPath: "/tmp/x.wav")
-            var c = AudioClip(url: url, name: "x", sourceDuration: 120, inPoint: 0, outPoint: 120,
+            var c = MediaClip(url: url, name: "x", sourceDuration: 120, inPoint: 0, outPoint: 120,
                               start: 0, length: 120, lane: 0)
             c.normalize()
             model.checkpoint()
@@ -191,10 +226,13 @@ enum SelfTest {
     // MARK: - Export checks
 
     private static func exportAndVerify(_ project: Project, _ settings: ExportSettings, to url: URL,
-                                        expectPillarbox: Bool, loudAt: Double? = nil, quietAt: Double? = nil) async throws {
+                                        expectPillarbox: Bool, loudAt: Double? = nil, quietAt: Double? = nil,
+                                        frames: [(Double, String)]? = nil) async throws {
         let start = Date()
-        try await VideoExporter().export(project: project, settings: settings, to: url) { _, _ in }
+        let exporter = VideoExporter()
+        try await exporter.export(project: project, settings: settings, to: url) { _, _ in }
         let seconds = Date().timeIntervalSince(start)
+        print("  ..   \(exporter.usedHardwareEncoder ? "hardware" : "software") H.264 encoder")
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         print("  ..   exported in \(String(format: "%.1f", seconds)) s, \(Timecode.byteCount(Double(size)))")
 
@@ -239,16 +277,66 @@ enum SelfTest {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
-        for t in [0.2, project.video.duration / 2, project.video.duration - 0.5] {
+        let expected = frames ?? [0.2, project.video.duration / 2, project.video.duration - 0.5].map { ($0, "photo") }
+        for (t, colour) in expected {
             let image = try await generator.image(at: CMTime(seconds: t, preferredTimescale: 600)).image
             let center = pixel(image, x: 0.5, y: 0.5)
-            check(center.r > 0.75 && center.g > 0.3 && center.g < 0.7 && center.b < 0.3,
-                  "frame at \(Timecode.format(t)) shows the photo (centre \(fmt(center)))")
+            check(classify(center) == colour,
+                  "frame at \(Timecode.format(t, tenths: true)) shows \(colour) (centre \(fmt(center)))")
             if expectPillarbox {
                 let edge = pixel(image, x: 0.03, y: 0.5)
                 check(edge.r < 0.08 && edge.g < 0.08 && edge.b < 0.08, "black bars beside the photo (\(fmt(edge)))")
             }
         }
+    }
+
+    private static let green = RGBColor(r: 0.05, g: 0.75, b: 0.2)
+    private static let blue = RGBColor(r: 0.1, g: 0.2, b: 0.9)
+
+    /// "photo" (the orange test photo), "green", "blue" or "other".
+    private static func classify(_ c: (r: Double, g: Double, b: Double)) -> String {
+        if c.r > 0.75 && c.g > 0.3 && c.g < 0.7 && c.b < 0.3 { return "photo" }
+        if c.g > 0.55 && c.r < 0.3 && c.b < 0.45 { return "green" }
+        if c.b > 0.65 && c.r < 0.35 && c.g < 0.45 { return "blue" }
+        return "other"
+    }
+
+    /// Video 1: the clip looped from 0:10 to 1:10. Video 2: its blue half at 0:30–0:32, on top.
+    /// Video 1 again: 0:01.5–0:04.5 of the clip, once, at 1:15–1:18.
+    private static func sampleVideoClips(_ url: URL) -> [MediaClip] {
+        var loop = MediaClip(url: url, name: "loop", sourceDuration: 4, inPoint: 0, outPoint: 4, start: 10, length: 60, lane: 0)
+        loop.kind = .video
+        loop.loop = true
+        var top = MediaClip(url: url, name: "top", sourceDuration: 4, inPoint: 2, outPoint: 4, start: 30, length: 2, lane: 1)
+        top.kind = .video
+        var once = MediaClip(url: url, name: "once", sourceDuration: 4, inPoint: 0.5, outPoint: 3.5, start: 75, length: 3, lane: 0)
+        once.kind = .video
+        return [loop, top, once].map { var c = $0; c.normalize(); return c }
+    }
+
+    private static func testVideoPlan() {
+        let clips = sampleVideoClips(URL(fileURLWithPath: "/tmp/v.mov"))
+        var p = Project()
+        p.video.duration = 90
+        p.clips = clips
+        let spans = p.videoSpans()
+        let ids = spans.map { s in s.clipID.flatMap { id in clips.firstIndex { $0.id == id } } }
+        check(ids == [nil, 0, 1, 0, nil, 2, nil], "video spans: photo, loop, top clip, loop, photo, clip, photo (\(ids))")
+        check(p.topVideoClip(at: 31)?.id == clips[1].id, "higher video lane plays on top")
+        check(p.topVideoClip(at: 72) == nil, "photo shows between clips")
+        let plan = VideoPlan(project: p, fps: 30, bitrate: 12_000_000)
+        check(plan.totalFrames == 2700, "plan covers every frame (\(plan.totalFrames))")
+        check(plan.encodedFrames == 270, "each loop pass is encoded once (\(plan.encodedFrames) frames encoded)")
+
+        var long = Project()
+        long.video.duration = Limits.maxDuration
+        var loop = clips[0]
+        loop.start = 0
+        loop.length = Limits.maxDuration
+        long.clips = [loop]
+        let longPlan = VideoPlan(project: long, fps: 30, bitrate: 12_000_000)
+        check(longPlan.totalFrames == 1_080_000 && longPlan.encodedFrames == 120,
+              "10-hour loop: \(longPlan.encodedFrames) of \(longPlan.totalFrames) frames encoded")
     }
 
     private static func fmt(_ c: (r: Double, g: Double, b: Double)) -> String {

@@ -35,7 +35,9 @@ final class EditorModel: ObservableObject {
 
     // MARK: Editing
     @Published var selection: Selection?
-    @Published var playhead: Double = 0
+    @Published var playhead: Double = 0 {
+        didSet { if !isPlaying && playhead != oldValue { refreshStillFrame() } }
+    }
     @Published private(set) var isPlaying = false
     @Published var errorMessage: String?
     @Published private(set) var canUndo = false
@@ -55,6 +57,21 @@ final class EditorModel: ObservableObject {
     @Published private(set) var exportState: ExportState = .idle
 
     let waveforms = WaveformStore()
+    let thumbnails = ThumbnailStore()
+
+    // MARK: Video preview
+    /// The video clip frame under the playhead, framed like the export (shown while paused).
+    @Published private(set) var stillFrame: NSImage?
+    /// A video clip (rather than the photo) is showing at the playhead.
+    @Published private(set) var clipAtPlayhead = false
+    /// The playing preview has video and the playhead is in a video clip.
+    @Published private(set) var videoVisible = false
+    @Published private(set) var player: AVPlayer?
+    private var playerHasVideo = false
+    private var playWindowEnd: Double = 0
+    private var stillTask: Task<Void, Never>?
+    private var userZoomed = false
+    private(set) lazy var hardwareSummary: String = HardwareInfo.summary()
 
     private var sourceImage: CGImage?
     private var undoStack: [Project] = [] { didSet { canUndo = !undoStack.isEmpty } }
@@ -64,7 +81,6 @@ final class EditorModel: ObservableObject {
     private var didInitialFit = false
     private var monitors: [Any] = []
 
-    private var player: AVPlayer?
     private var timer: Timer?
     private var clockHead: Double = 0
     private var clockStart: CFTimeInterval = 0
@@ -78,12 +94,12 @@ final class EditorModel: ObservableObject {
         projectURL?.deletingPathExtension().lastPathComponent ?? "10 Hour Vids"
     }
 
-    var selectedClip: AudioClip? {
+    var selectedClip: MediaClip? {
         if case .clip(let id) = selection { return clip(id) }
         return nil
     }
 
-    func clip(_ id: UUID) -> AudioClip? { project.clips.first { $0.id == id } }
+    func clip(_ id: UUID) -> MediaClip? { project.clips.first { $0.id == id } }
 
     // MARK: - Change handling
 
@@ -94,12 +110,50 @@ final class EditorModel: ObservableObject {
             renderPreview()
         }
         if project.clips != old.clips {
-            for c in project.clips { waveforms.request(c.url) }
+            for c in project.clips {
+                if c.kind == .video { thumbnails.request(c.url) } else { waveforms.request(c.url) }
+            }
             if isPlaying { scheduleAudioRestart() }
-        } else if project.video.duration != old.video.duration, isPlaying {
+        } else if project.video != old.video, isPlaying {
             scheduleAudioRestart()
         }
         if playhead > project.video.duration { playhead = project.video.duration }
+        if !isPlaying && (project.clips != old.clips || project.video != old.video) { refreshStillFrame() }
+    }
+
+    /// Shows the video frame under the playhead in the preview (or clears it over the photo).
+    private func refreshStillFrame() {
+        stillTask?.cancel()
+        guard let clip = project.topVideoClip(at: playhead) else {
+            if clipAtPlayhead { clipAtPlayhead = false }
+            if stillFrame != nil { stillFrame = nil }
+            return
+        }
+        if !clipAtPlayhead { clipAtPlayhead = true }
+        let url = clip.url
+        let time = clip.sourceTime(at: playhead)
+        let mode: FitMode = project.video.fitMode == .fill ? .fill : .fit
+        let background = project.video.background
+        stillTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 30_000_000)  // let quick scrubbing settle
+            guard !Task.isCancelled else { return }
+            let image = await EditorModel.renderStill(url: url, time: time, mode: mode, background: background)
+            guard !Task.isCancelled, let self else { return }
+            self.stillFrame = image
+        }
+    }
+
+    nonisolated static func renderStill(url: URL, time: Double, mode: FitMode, background: RGBColor) async -> NSImage? {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 1280, height: 720)
+        let tolerance = CMTime(value: 1, timescale: 20)
+        generator.requestedTimeToleranceBefore = tolerance
+        generator.requestedTimeToleranceAfter = tolerance
+        guard let frame = try? await generator.image(at: CMTime(seconds: time, preferredTimescale: 600)).image,
+              let framed = FrameRenderer.renderImage(image: frame, width: 1280, height: 720, mode: mode, background: background)
+        else { return nil }
+        return NSImage(cgImage: framed, size: NSSize(width: 1280, height: 720))
     }
 
     private func loadImage() {
@@ -194,42 +248,50 @@ final class EditorModel: ObservableObject {
         if panel.runModal() == .OK, let url = panel.url { setImage(url) }
     }
 
-    // MARK: - Audio import
+    // MARK: - Audio and video import
 
-    func addAudioPanel() {
+    func addMediaPanel() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.audio, .movie]
         panel.allowsMultipleSelection = true
-        panel.message = "Choose music or audio files"
-        if panel.runModal() == .OK { addAudio(panel.urls) }
+        panel.message = "Choose music, audio or video files"
+        if panel.runModal() == .OK { addMedia(panel.urls) }
     }
 
-    /// Adds audio files to the timeline one after another, starting at `time`
-    /// (default: after the last clip in the lane).
-    func addAudio(_ urls: [URL], at time: Double? = nil, lane: Int? = nil) {
+    /// Adds audio and video files to the timeline one after another, starting at `time`
+    /// (default: after the last clip in the lane). Files with pictures become video clips.
+    func addMedia(_ urls: [URL], at time: Double? = nil, audioLane: Int? = nil, videoLane: Int? = nil) {
         guard !urls.isEmpty else { return }
-        Task { await addAudioAsync(urls, at: time, lane: lane) }
+        Task { await addMediaAsync(urls, at: time, audioLane: audioLane, videoLane: videoLane) }
     }
 
-    private func addAudioAsync(_ urls: [URL], at time: Double?, lane: Int?) async {
-        let targetLane = lane ?? 0
-        var t = time ?? (project.clips.filter { $0.lane == targetLane }.map(\.end).max() ?? 0)
-        var added: [AudioClip] = []
+    private func addMediaAsync(_ urls: [URL], at time: Double?, audioLane: Int?, videoLane: Int?) async {
+        var cursor: [ClipKind: Double] = [:]
+        var added: [MediaClip] = []
         var failures: [String] = []
         for url in urls {
             do {
                 let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-                let tracks = try await asset.loadTracks(withMediaType: .audio)
-                guard !tracks.isEmpty else { throw AppError("No audio track") }
+                let hasVideo = !(try await asset.loadTracks(withMediaType: .video)).isEmpty
+                let hasAudio = !(try await asset.loadTracks(withMediaType: .audio)).isEmpty
+                guard hasVideo || hasAudio else { throw AppError("No audio or video") }
                 let duration = try await asset.load(.duration).seconds
-                guard duration.isFinite, duration > Limits.minClipLength else { throw AppError("Empty audio") }
-                var clip = AudioClip(url: url, name: url.deletingPathExtension().lastPathComponent,
+                guard duration.isFinite, duration > Limits.minClipLength else { throw AppError("Empty file") }
+                let kind: ClipKind = hasVideo ? .video : .audio
+                let lane = (kind == .video ? videoLane : audioLane) ?? 0
+                let laneEnds: [Double] = (project.clips + added)
+                    .filter { $0.kind == kind && $0.lane == lane }
+                    .map { $0.end }
+                let laneEnd: Double = laneEnds.max() ?? 0
+                let start: Double = cursor[kind] ?? time ?? laneEnd
+                var clip = MediaClip(url: url, name: url.deletingPathExtension().lastPathComponent,
                                      sourceDuration: duration, inPoint: 0, outPoint: duration,
-                                     start: max(0, t), length: duration, lane: targetLane)
+                                     start: max(0, start), length: duration, lane: lane)
+                clip.kind = kind
                 clip.normalize()
-                clip.lane = freeLane(for: clip, among: project.clips + added, from: targetLane)
+                clip.lane = freeLane(for: clip, among: project.clips + added, from: lane)
                 added.append(clip)
-                t = clip.end
+                cursor[kind] = clip.end
             } catch {
                 failures.append(url.lastPathComponent)
             }
@@ -240,11 +302,11 @@ final class EditorModel: ObservableObject {
             selection = .clip(added[added.count - 1].id)
         }
         if !failures.isEmpty {
-            errorMessage = "These files don’t contain audio that macOS can read:\n" + failures.joined(separator: "\n")
+            errorMessage = "These files don’t contain audio or video that macOS can read:\n" + failures.joined(separator: "\n")
         }
     }
 
-    private func freeLane(for clip: AudioClip, among clips: [AudioClip], from lane: Int) -> Int {
+    private func freeLane(for clip: MediaClip, among clips: [MediaClip], from lane: Int) -> Int {
         var candidate = clip
         var l = max(0, lane)
         while true {
@@ -256,21 +318,21 @@ final class EditorModel: ObservableObject {
 
     /// Handles files dropped on the window or the timeline. Returns true if anything was used.
     @discardableResult
-    func handleDrop(_ urls: [URL], time: Double? = nil, lane: Int? = nil) -> Bool {
+    func handleDrop(_ urls: [URL], time: Double? = nil, audioLane: Int? = nil, videoLane: Int? = nil) -> Bool {
         var images: [URL] = []
-        var audio: [URL] = []
+        var media: [URL] = []
         for url in urls where url.isFileURL {
             guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else { continue }
             if type.conforms(to: .image) {
                 images.append(url)
             } else if type.conforms(to: .audiovisualContent) || type.conforms(to: .audio) {
-                audio.append(url)
+                media.append(url)
             }
         }
         if let image = images.first { setImage(image) }
-        if !audio.isEmpty { addAudio(audio, at: time, lane: lane) }
-        if images.isEmpty && audio.isEmpty {
-            errorMessage = "Drop a photo (JPEG, PNG, HEIC…) or audio files (MP3, M4A, WAV, AIFF…)."
+        if !media.isEmpty { addMedia(media, at: time, audioLane: audioLane, videoLane: videoLane) }
+        if images.isEmpty && media.isEmpty {
+            errorMessage = "Drop a photo (JPEG, PNG, HEIC…), video (MOV, MP4, M4V…) or audio files (MP3, M4A, WAV, AIFF…)."
             return false
         }
         return true
@@ -287,8 +349,8 @@ final class EditorModel: ObservableObject {
     }
 
     func matchAudioLength() {
-        guard project.audioEnd > 0 else { return }
-        setDuration(project.audioEnd.rounded(.up), refit: true)
+        guard project.mediaEnd > 0 else { return }
+        setDuration(project.mediaEnd.rounded(.up), refit: true)
     }
 
     func dragDuration(origin: Double, delta: Double) {
@@ -310,7 +372,7 @@ final class EditorModel: ObservableObject {
 
     // MARK: - Clip editing
 
-    func updateClip(_ id: UUID, checkpoint cp: Bool = true, coalescing key: String? = nil, _ body: (inout AudioClip) -> Void) {
+    func updateClip(_ id: UUID, checkpoint cp: Bool = true, coalescing key: String? = nil, _ body: (inout MediaClip) -> Void) {
         guard let index = project.clips.firstIndex(where: { $0.id == id }) else { return }
         var c = project.clips[index]
         body(&c)
@@ -320,7 +382,7 @@ final class EditorModel: ObservableObject {
         project.clips[index] = c
     }
 
-    func moveClip(_ id: UUID, origin: AudioClip, deltaTime: Double, deltaLanes: Int) {
+    func moveClip(_ id: UUID, origin: MediaClip, deltaTime: Double, deltaLanes: Int) {
         let start = snapped(start: max(0, origin.start + deltaTime), length: origin.length, excluding: id)
         updateClip(id, checkpoint: false) { c in
             c.start = start
@@ -335,7 +397,7 @@ final class EditorModel: ObservableObject {
         updateClip(id, checkpoint: false) { $0.lane = lane }
     }
 
-    func trimClip(_ id: UUID, edge: TrimEdge, origin o: AudioClip, delta: Double) {
+    func trimClip(_ id: UUID, edge: TrimEdge, origin o: MediaClip, delta: Double) {
         let minLen = Limits.minClipLength
         updateClip(id, checkpoint: false) { c in
             switch edge {
@@ -347,7 +409,7 @@ final class EditorModel: ObservableObject {
                 c.start = o.start + d
                 c.length = o.length - d
                 if o.loop {
-                    c.offset = AudioClip.wrap(o.offset + d, o.region)
+                    c.offset = MediaClip.wrap(o.offset + d, o.region)
                 } else {
                     c.inPoint = o.inPoint + d
                 }
@@ -447,7 +509,7 @@ final class EditorModel: ObservableObject {
 
     // MARK: - Timeline geometry
 
-    var totalLength: Double { max(project.video.duration, project.audioEnd) }
+    var totalLength: Double { max(project.video.duration, project.mediaEnd) }
     var contentLength: Double { max(totalLength, Limits.minDuration) * 1.06 + 5 }
     var fitPixelsPerSecond: Double { Double(max(timelineWidth, 100)) / contentLength }
     var minPixelsPerSecond: Double { fitPixelsPerSecond * 0.5 }
@@ -459,7 +521,7 @@ final class EditorModel: ObservableObject {
     func timelineResized(_ width: CGFloat) {
         guard width > 10, abs(width - timelineWidth) > 0.5 || !didInitialFit else { return }
         timelineWidth = width
-        if !didInitialFit {
+        if !didInitialFit || !userZoomed {
             didInitialFit = true
             zoomToFit()
         } else {
@@ -481,6 +543,7 @@ final class EditorModel: ObservableObject {
         let anchor = anchorX ?? ((playheadX >= 0 && playheadX <= timelineWidth) ? playheadX : timelineWidth / 2)
         let t = time(atX: anchor)
         pixelsPerSecond = min(max(pps, minPixelsPerSecond), Self.maxPixelsPerSecond)
+        userZoomed = true
         visibleStart = t - Double(anchor) / pixelsPerSecond
         clampScroll()
     }
@@ -492,6 +555,7 @@ final class EditorModel: ObservableObject {
     func zoomToFit() {
         pixelsPerSecond = fitPixelsPerSecond
         visibleStart = 0
+        userZoomed = false
     }
 
     private func keepPlayheadVisible() {
@@ -527,6 +591,9 @@ final class EditorModel: ObservableObject {
         audioGeneration += 1
         player?.pause()
         player = nil
+        playerHasVideo = false
+        videoVisible = false
+        refreshStillFrame()
     }
 
     func seek(to t: Double) {
@@ -557,6 +624,16 @@ final class EditorModel: ObservableObject {
         }
         playhead = t
         keepPlayheadVisible()
+        let inClip = project.topVideoClip(at: t) != nil
+        if inClip != clipAtPlayhead { clipAtPlayhead = inClip }
+        let showVideo = inClip && playerHasVideo
+        if showVideo != videoVisible { videoVisible = showVideo }
+        // The preview is built for a stretch of the timeline at a time; build the next stretch in time.
+        if player != nil, t > playWindowEnd - 1, playWindowEnd < project.video.duration {
+            playWindowEnd = project.video.duration
+            resetClock()
+            restartAudio()
+        }
     }
 
     private func scheduleAudioRestart() {
@@ -569,21 +646,29 @@ final class EditorModel: ObservableObject {
         }
     }
 
+    /// Builds the preview (audio of every clip plus the visible video) for the next half hour and plays it.
     private func restartAudio() {
         audioGeneration += 1
         let generation = audioGeneration
         player?.pause()
         player = nil
-        let clips = project.clips
-        let limit = project.video.duration
-        guard !clips.isEmpty else { return }
+        playerHasVideo = false
+        videoVisible = false
+        let project = self.project
+        guard !project.clips.isEmpty else { return }
+        let window = max(0, playhead - 1)...min(project.video.duration, playhead + 1800)
+        playWindowEnd = window.upperBound
         Task { [weak self] in
-            guard let built = try? await CompositionBuilder.build(clips: clips, limit: limit), built.duration > 0 else { return }
+            guard let built = try? await CompositionBuilder.buildPreview(project: project, window: window,
+                                                                          renderSize: CGSize(width: 1280, height: 720)),
+                  built.composition.duration.seconds > 0 else { return }
             guard let self, self.isPlaying, generation == self.audioGeneration else { return }
             let item = AVPlayerItem(asset: built.composition)
             item.audioMix = built.audioMix
+            item.videoComposition = built.videoComposition
             let player = AVPlayer(playerItem: item)
             self.player = player
+            self.playerHasVideo = built.videoComposition != nil
             let position = self.playhead
             _ = await player.seek(to: CompositionBuilder.cm(position), toleranceBefore: .zero, toleranceAfter: .zero)
             guard self.isPlaying, generation == self.audioGeneration else { return }
