@@ -279,8 +279,11 @@ final class EditorModel: ObservableObject {
                 guard duration.isFinite, duration > Limits.minClipLength else { throw AppError("Empty file") }
                 let kind: ClipKind = hasVideo ? .video : .audio
                 let lane = (kind == .video ? videoLane : audioLane) ?? 0
-                let start = cursor[kind] ?? time
-                    ?? ((project.clips + added).filter { $0.kind == kind && $0.lane == lane }.map(\.end).max() ?? 0)
+                let laneEnds: [Double] = (project.clips + added)
+                    .filter { $0.kind == kind && $0.lane == lane }
+                    .map { $0.end }
+                let laneEnd: Double = laneEnds.max() ?? 0
+                let start: Double = cursor[kind] ?? time ?? laneEnd
                 var clip = MediaClip(url: url, name: url.deletingPathExtension().lastPathComponent,
                                      sourceDuration: duration, inPoint: 0, outPoint: duration,
                                      start: max(0, start), length: duration, lane: lane)
